@@ -3,9 +3,11 @@
  * @group unit
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import stripAnsi from 'strip-ansi';
 import {
   daemonMatchesRequest,
   deriveDaemonIdentity,
+  ensureOtlpProxy,
   type ConnectTargets,
   type RequestedDaemonConfig,
 } from '../connect-orchestrator.js';
@@ -26,6 +28,10 @@ vi.mock('../daemon-manager.js', () => ({
   spawnDaemon: vi.fn(),
   stopDaemon: vi.fn(),
 }));
+vi.mock('@/utils/processes.js', () => ({
+  isProcessAlive: vi.fn().mockReturnValue(false),
+  spawnDetached: vi.fn(),
+}));
 vi.mock('../health-check.js', () => ({
   checkProxyHealth: vi.fn(),
 }));
@@ -41,6 +47,16 @@ vi.mock('../connectors/vscode.js', () => ({
 }));
 vi.mock('../connectors/vscode-claude-code.js', () => ({
   writeVsCodeClaudeCodeConfig: vi.fn(),
+}));
+vi.mock('../connectors/claude-code-otlp.js', () => ({
+  writeClaudeCodeOtlpConfig: vi.fn().mockResolvedValue({
+    written: true,
+    path: '/mock/claude/settings.json',
+    backupPath: null,
+    hookEvents: 8,
+    envVars: 9,
+    allowlist: ['/repo/project'],
+  }),
 }));
 vi.mock('../connectors/managed-mcp-remote.js', () => ({
   fetchManagedMcpServers: vi.fn().mockResolvedValue([]),
@@ -462,6 +478,71 @@ describe('connectTargets — per-target dispatch, summary, partial-failure seman
     expect(console_.log()).toHaveBeenCalledWith(expect.stringContaining('Targets configured'));
     expect(writeVsCodeLanguageModelsConfig).toHaveBeenCalledWith('http://127.0.0.1:4001', 'gk', false);
   });
+
+  it('prints the resolved Claude Code analytics configuration', async () => {
+    await setupHappyMocks({
+      name: 'preview',
+      baseUrl: 'https://codemie-preview.lab.epam.com/code-assistant-api',
+      codeMieUrl: 'https://codemie.lab.epam.com',
+      ssoConfig: { apiUrl: 'https://codemie-preview.lab.epam.com/code-assistant-api' },
+    });
+    const { checkStatus, spawnDaemon } = await import('../daemon-manager.js');
+    vi.mocked(checkStatus).mockResolvedValue({ running: false, state: null });
+    vi.mocked(spawnDaemon).mockResolvedValue(
+      daemonState({
+        clientType: 'claude-code-otlp',
+        syncApiUrl: 'https://codemie-preview.lab.epam.com/code-assistant-api',
+      }) as Awaited<ReturnType<typeof spawnDaemon>>
+    );
+    const { connectTargets } = await import('../connect-orchestrator.js');
+
+    await connectTargets({ targets: { claudeCodeOtlp: true }, scope: 'project' });
+
+    const output = console_.log().mock.calls
+      .map(([message]) => stripAnsi(String(message)))
+      .join('\n');
+    expect(output).toMatch(/Profile\s+│\s+preview/);
+    expect(output).toMatch(/CodeMie URL\s+│\s+https:\/\/codemie-preview\.lab\.epam\.com/);
+    expect(output).not.toContain('Analytics destination:');
+    expect(output).toMatch(/Scope\s+│\s+project/);
+    expect(output).toMatch(/Tracked projects\s+│\s+\/repo\/project/);
+    expect(output).toMatch(/OTel records may be sent for sessions with tracked-project hooks that pass daemon checks/);
+    expect(console_.log()).toHaveBeenCalledWith(
+      expect.stringContaining('Claude Code Analytics configured successfully')
+    );
+  });
+
+  it('prints default scope and all projects without a CodeMie URL when allowlist is empty', async () => {
+    await setupHappyMocks({
+      name: 'preview',
+      codeMieUrl: undefined,
+    });
+    const { checkStatus, spawnDaemon } = await import('../daemon-manager.js');
+    const { writeClaudeCodeOtlpConfig } = await import('../connectors/claude-code-otlp.js');
+    vi.mocked(checkStatus).mockResolvedValue({ running: false, state: null });
+    vi.mocked(spawnDaemon).mockResolvedValue(
+      daemonState({ clientType: 'claude-code-otlp' }) as Awaited<ReturnType<typeof spawnDaemon>>
+    );
+    vi.mocked(writeClaudeCodeOtlpConfig).mockResolvedValue({
+      written: true,
+      path: '/mock/claude/settings.json',
+      backupPath: null,
+      hookEvents: 8,
+      envVars: 9,
+      allowlist: [],
+    });
+    const { connectTargets } = await import('../connect-orchestrator.js');
+
+    await connectTargets({ targets: { claudeCodeOtlp: true } });
+
+    const output = console_.log().mock.calls
+      .map(([message]) => stripAnsi(String(message)))
+      .join('\n');
+    expect(output).toMatch(/Profile\s+│\s+preview/);
+    expect(output).not.toContain('CodeMie URL');
+    expect(output).toMatch(/Scope\s+│\s+user/);
+    expect(output).toMatch(/Tracked projects\s+│\s+all projects/);
+  });
 });
 
 describe('deriveDaemonIdentity — codex-desktop', () => {
@@ -486,6 +567,56 @@ describe('deriveDaemonIdentity — codex-desktop', () => {
 
     expect(deriveDaemonIdentity({ codexDesktop: true, vscode: true }).clientType)
       .toBe('codex-desktop');
+  });
+});
+
+describe('ensureOtlpProxy', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it('returns silently and does not spawn a daemon when baseUrl is undefined', async () => {
+    const { readState, spawnDaemon } = await import('../daemon-manager.js');
+    vi.mocked(readState).mockResolvedValue(null);
+    await setupHappyMocks({ baseUrl: undefined });
+
+    await expect(ensureOtlpProxy('claude-code-otlp')).resolves.toBeUndefined();
+
+    expect(spawnDaemon).not.toHaveBeenCalled();
+  });
+
+  it('returns silently and does not spawn a daemon when baseUrl is an empty string', async () => {
+    const { readState, spawnDaemon } = await import('../daemon-manager.js');
+    vi.mocked(readState).mockResolvedValue(null);
+    await setupHappyMocks({ baseUrl: '' });
+
+    await expect(ensureOtlpProxy('claude-code-otlp')).resolves.toBeUndefined();
+
+    expect(spawnDaemon).not.toHaveBeenCalled();
+  });
+
+  it('returns silently and does not spawn a daemon when baseUrl is whitespace-only', async () => {
+    const { readState, spawnDaemon } = await import('../daemon-manager.js');
+    vi.mocked(readState).mockResolvedValue(null);
+    await setupHappyMocks({ baseUrl: '   ' });
+
+    await expect(ensureOtlpProxy('claude-code-otlp')).resolves.toBeUndefined();
+
+    expect(spawnDaemon).not.toHaveBeenCalled();
+  });
+
+  it('still cold-starts normally when baseUrl is present', async () => {
+    const { readState, spawnDaemon, checkStatus } = await import('../daemon-manager.js');
+    vi.mocked(readState).mockResolvedValue(null);
+    vi.mocked(checkStatus).mockResolvedValue({ running: false, state: null });
+    vi.mocked(spawnDaemon).mockResolvedValue(
+      daemonState({ telemetryMode: 'claude-code-otlp' }) as Awaited<ReturnType<typeof spawnDaemon>>
+    );
+    await setupHappyMocks();
+
+    await ensureOtlpProxy('claude-code-otlp');
+
+    expect(spawnDaemon).toHaveBeenCalledTimes(1);
   });
 });
 
